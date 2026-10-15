@@ -176,3 +176,74 @@ async def test_completed_warmup_gates_instance_ready_for_request():
             assert after["ready_for_request"] is True
     finally:
         await gateway.runtime.client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_parallel_warmups_generate_only_once():
+    import asyncio
+    calls = 0
+    async def handler(request):
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.03)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "hi"}}]})
+    gateway.runtime.phase = "ready"
+    gateway.runtime.process = SimpleNamespace(returncode=None)
+    gateway.runtime.warmup_completed = False
+    gateway.runtime.warmup_lock = asyncio.Lock()
+    gateway.runtime.warmup_attempts = 0
+    gateway.runtime.warmup_reused = 0
+    gateway.runtime.active = 0
+    gateway.runtime.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    payload = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 1, "stream": False}
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app), base_url="http://test") as client:
+            a, b = await asyncio.gather(
+                client.post("/v1/chat/completions", json=payload, headers={"X-CR-Warmup": "1"}),
+                client.post("/v1/chat/completions", json=payload, headers={"X-CR-Warmup": "1"}),
+            )
+            assert [a.status_code, b.status_code] == [200, 200]
+            assert calls == 1
+            assert gateway.runtime.warmup_attempts == 1
+            assert gateway.runtime.warmup_reused == 1
+            assert a.headers.get("x-cr-warmup-reused") == "1" or b.headers.get("x-cr-warmup-reused") == "1"
+            assert gateway.runtime.active == 0
+    finally:
+        await gateway.runtime.client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_failed_warmup_does_not_poison_future_attempt():
+    import asyncio
+    calls = 0
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(503 if calls == 1 else 200, json={"ok": True})
+    gateway.runtime.phase = "ready"
+    gateway.runtime.process = SimpleNamespace(returncode=None)
+    gateway.runtime.warmup_completed = False
+    gateway.runtime.warmup_lock = asyncio.Lock()
+    gateway.runtime.active = 0
+    gateway.runtime.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    payload = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 1, "stream": False}
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app), base_url="http://test") as client:
+            first = await client.post("/v1/chat/completions", json=payload, headers={"X-CR-Warmup": "1"})
+            second = await client.post("/v1/chat/completions", json=payload, headers={"X-CR-Warmup": "1"})
+            assert (first.status_code, second.status_code) == (503, 200)
+            assert calls == 2
+            assert gateway.runtime.warmup_completed
+    finally:
+        await gateway.runtime.client.aclose()
+
+
+def test_stream_probe_tracks_content_gap_and_usage():
+    import time
+    probe = gateway.StreamProbe(time.monotonic())
+    assert probe.observe(b'data: {"choices":[{"delta":{"content":"Hola"}}]}\\n\\n'.replace(b'\\n', b'\n'))
+    assert not probe.observe(b'data: {"choices":[{"delta":{"content":" mundo"}}]}\\n\\n'.replace(b'\\n', b'\n'))
+    assert not probe.observe(b'data: {"choices":[],"usage":{"completion_tokens":2}}\\n\\n'.replace(b'\\n', b'\n'))
+    assert probe.content_events == 2
+    assert probe.output_tokens == 2
+    assert probe.max_content_gap_ms >= 0

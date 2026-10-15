@@ -7,6 +7,7 @@ The real vLLM server runs on loopback only, after this health server starts.
 from __future__ import annotations
 
 import asyncio
+import codecs
 from contextlib import asynccontextmanager, suppress
 import json
 import logging
@@ -52,6 +53,10 @@ class Runtime:
         self.failed = 0
         self.warmup_completed = False
         self.warmup_finished_ms: int | None = None
+        self.warmup_processing_ms: int | None = None
+        self.warmup_attempts = 0
+        self.warmup_reused = 0
+        self.warmup_lock = asyncio.Lock()
         self.lock = asyncio.Lock()
 
     @property
@@ -134,6 +139,10 @@ async def lifespan(_: FastAPI):
     runtime.ready_at = None
     runtime.warmup_completed = False
     runtime.warmup_finished_ms = None
+    runtime.warmup_processing_ms = None
+    runtime.warmup_attempts = 0
+    runtime.warmup_reused = 0
+    runtime.warmup_lock = asyncio.Lock()
     runtime.client = httpx.AsyncClient(timeout=httpx.Timeout(connect=10, read=315, write=30, pool=10))
     try:
         log("worker_boot", model=MODEL_ID, baked_model=MODEL_PATH,
@@ -183,6 +192,10 @@ async def status():
             "model_loaded": model_loaded,
             "warmup_completed": runtime.warmup_completed,
             "warmup_finished_ms": runtime.warmup_finished_ms,
+            "warmup_processing_ms": runtime.warmup_processing_ms,
+            "warmup_in_progress": runtime.warmup_lock.locked(),
+            "warmup_attempts": runtime.warmup_attempts,
+            "warmup_reused": runtime.warmup_reused,
             "instance_id": runtime.instance_id,
             "ready_for_request": model_loaded and runtime.warmup_completed and available_slots > 0,
             "active_requests": runtime.active,
@@ -231,18 +244,22 @@ class StreamProbe:
         self.first_byte_ms: int | None = None
         self.first_token_ms: int | None = None
         self.buffer = ""
+        self.decoder = codecs.getincrementaldecoder("utf-8")()
+        self.content_events = 0
+        self.last_content_ms: int | None = None
+        self.max_content_gap_ms = 0
+        self.output_tokens: int | None = None
 
     def observe(self, chunk: bytes) -> bool:
         if self.first_byte_ms is None:
             self.first_byte_ms = elapsed_ms(self.started)
-        if self.first_token_ms is not None:
-            return False
-        self.buffer += chunk.decode("utf-8", errors="replace")
+        self.buffer += self.decoder.decode(chunk)
         # SSE events can span multiple TCP chunks; ignore unbounded invalid input.
         if len(self.buffer) > 262144:
             self.buffer = ""
             return False
         self.buffer = self.buffer.replace("\r\n", "\n")
+        first_content = False
         while "\n\n" in self.buffer:
             frame, self.buffer = self.buffer.split("\n\n", 1)
             for line in frame.splitlines():
@@ -250,17 +267,73 @@ class StreamProbe:
                     continue
                 try:
                     data = json.loads(line[6:])
-                    choices = data.get("choices", [])
-                    if any(c.get("delta", {}).get("content") or c.get("text") for c in choices):
-                        self.first_token_ms = elapsed_ms(self.started)
-                        return True
+                    if not isinstance(data, dict):
+                        continue
+                    usage = data.get("usage")
+                    if isinstance(usage, dict):
+                        tokens = usage.get("completion_tokens")
+                        if type(tokens) is int and tokens >= 0:
+                            self.output_tokens = tokens
+                    choices = data.get("choices") or []
+                    if not any(c.get("delta", {}).get("content") or c.get("text") for c in choices):
+                        continue
+                    now_ms = elapsed_ms(self.started)
+                    if self.last_content_ms is not None:
+                        self.max_content_gap_ms = max(
+                            self.max_content_gap_ms, now_ms - self.last_content_ms
+                        )
+                    self.last_content_ms = now_ms
+                    self.content_events += 1
+                    if self.first_token_ms is None:
+                        self.first_token_ms = now_ms
+                        first_content = True
                 except (ValueError, AttributeError, TypeError):
                     pass
-        return False
+        return first_content
 
 
 def stage_event(phase: str, request_id: str) -> bytes:
     return f"event: cr.status\ndata: {json.dumps({'phase': phase, 'request_id': request_id})}\n\n".encode()
+
+
+async def forward_nonstream(
+    trace_id: str,
+    started: float,
+    route: str,
+    payload: dict,
+    is_warmup: bool,
+) -> Response:
+    """One admission/release per real inference, even when an upstream call fails."""
+    await reserve(trace_id)
+    log("request_accepted", request_id=trace_id, route=route, stream=False,
+        message_count=len(payload.get("messages", [])) if isinstance(payload.get("messages"), list) else 0,
+        active=runtime.active)
+    failed = True
+    try:
+        if is_warmup:
+            runtime.warmup_attempts += 1
+        upstream = await runtime.client.post(
+            MODEL_URL + route, json=payload, headers={"X-Request-Id": trace_id}
+        )
+        processing_ms = elapsed_ms(started)
+        failed = upstream.status_code >= 400
+        if is_warmup and upstream.status_code == 200:
+            runtime.warmup_completed = True
+            runtime.warmup_finished_ms = elapsed_ms(runtime.started)
+            runtime.warmup_processing_ms = processing_ms
+            log("warmup_completed", instance_id=runtime.instance_id, request_id=trace_id,
+                warmup_finished_ms=runtime.warmup_finished_ms,
+                warmup_processing_ms=processing_ms)
+        log("request_finished", request_id=trace_id, status=upstream.status_code,
+            processing_ms=processing_ms, stream=False)
+        return Response(content=upstream.content, status_code=upstream.status_code,
+                        media_type="application/json", headers=worker_headers(trace_id, processing_ms))
+    except httpx.HTTPError as exc:
+        log("upstream_error", request_id=trace_id, error_type=type(exc).__name__,
+            ms=elapsed_ms(started))
+        raise HTTPException(status_code=502, detail="Inference engine temporarily unavailable") from None
+    finally:
+        await release(failed)
 
 
 @app.post("/v1/chat/completions")
@@ -299,27 +372,37 @@ async def inference(request: Request):
     if is_warmup and (streaming or payload.get("max_tokens") != 1):
         raise HTTPException(status_code=400, detail="Warmup must be nonstreaming and one token")
     opt_in_events = streaming and request.headers.get("x-cr-status-events") == "1"
+    if is_warmup:
+        # Runpod can route several backend warmup calls to the same worker.
+        # Serialize them per boot, then reuse the first successful result.
+        # Keep the normal inference path unlocked so it is not held up.
+        async with runtime.warmup_lock:
+            if not runtime.ready:
+                raise HTTPException(status_code=503, detail="Model not ready",
+                                    headers={"Retry-After": "3", "X-CR-Safe-Rejection": "1"})
+            if runtime.warmup_completed:
+                runtime.warmup_reused += 1
+                log("warmup_reused", request_id=trace_id, instance_id=runtime.instance_id,
+                    reused_count=runtime.warmup_reused)
+                return JSONResponse(
+                    {"status": "already_warm", "instance_id": runtime.instance_id},
+                    headers={**worker_headers(trace_id, elapsed_ms(started)),
+                             "X-CR-Warmup-Reused": "1"},
+                )
+            return await forward_nonstream(
+                trace_id, started, request.url.path, payload, is_warmup=True
+            )
+    if not streaming:
+        return await forward_nonstream(
+            trace_id, started, request.url.path, payload, is_warmup=False
+        )
+
     await reserve(trace_id)
-    log("request_accepted", request_id=trace_id, route=request.url.path, stream=streaming,
+    log("request_accepted", request_id=trace_id, route=request.url.path, stream=True,
         message_count=len(payload.get("messages", [])) if isinstance(payload.get("messages"), list) else 0,
         active=runtime.active)
     headers = {"X-Request-Id": trace_id}  # Do not forward the Runpod bearer token.
     try:
-        if not streaming:
-            upstream = await runtime.client.post(MODEL_URL + request.url.path, json=payload, headers=headers)
-            processing_ms = elapsed_ms(started)
-            failed = upstream.status_code >= 400
-            if is_warmup and not failed:
-                runtime.warmup_completed = True
-                runtime.warmup_finished_ms = elapsed_ms(runtime.started)
-                log("warmup_completed", instance_id=runtime.instance_id, request_id=trace_id,
-                    warmup_finished_ms=runtime.warmup_finished_ms)
-            await release(failed)
-            log("request_finished", request_id=trace_id, status=upstream.status_code,
-                processing_ms=processing_ms, stream=False)
-            return Response(content=upstream.content, status_code=upstream.status_code,
-                            media_type="application/json", headers=worker_headers(trace_id, processing_ms))
-
         context = runtime.client.stream("POST", MODEL_URL + request.url.path, json=payload, headers=headers)
         upstream = await context.__aenter__()
         if upstream.status_code != 200:
@@ -361,9 +444,20 @@ async def inference(request: Request):
         finally:
             await context.__aexit__(None, None, None)
             await release(failed)
+            processing_ms = elapsed_ms(started)
+            decoding_ms = (
+                max(1, processing_ms - probe.first_token_ms)
+                if probe.first_token_ms is not None else None
+            )
+            tokens_per_second = (
+                round(probe.output_tokens / (decoding_ms / 1000), 2)
+                if probe.output_tokens is not None and decoding_ms else None
+            )
             log("request_finished", request_id=trace_id, stream=True, failed=failed,
-                processing_ms=elapsed_ms(started), first_byte_ms=probe.first_byte_ms,
-                first_token_ms=probe.first_token_ms)
+                processing_ms=processing_ms, first_byte_ms=probe.first_byte_ms,
+                first_token_ms=probe.first_token_ms, content_events=probe.content_events,
+                max_content_gap_ms=probe.max_content_gap_ms,
+                output_tokens=probe.output_tokens, tokens_per_second=tokens_per_second)
 
     return StreamingResponse(forward(), media_type="text/event-stream",
                              headers={**worker_headers(trace_id), "X-Accel-Buffering": "no"})
