@@ -113,3 +113,36 @@ def test_stream_probe_distinguishes_role_from_content_token():
     assert not probe.observe(b'data: {"choices":[{"delta":{"content":"Bon')
     assert probe.observe(b'jour"}}]}\n\n')
     assert probe.first_token_ms is not None
+
+
+@pytest.mark.asyncio
+async def test_status_requires_model_loaded_and_available_slots():
+    gateway.runtime.phase = "ready"
+    gateway.runtime.process = SimpleNamespace(returncode=None)
+    gateway.runtime.instance_id = "boot-a"
+    gateway.runtime.active = gateway.MAX_IN_FLIGHT
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app), base_url="http://test") as client:
+        result = (await client.get("/status")).json()
+        assert result["model_loaded"] is True
+        assert result["ready_for_request"] is False
+        assert result["available_slots"] == 0
+        gateway.runtime.active = 0
+        result = (await client.get("/status")).json()
+        assert result["ready_for_request"] is True
+        assert result["instance_id"] == "boot-a"
+
+
+@pytest.mark.asyncio
+async def test_instance_mismatch_is_rejected_before_any_inference():
+    gateway.runtime.phase = "ready"
+    gateway.runtime.process = SimpleNamespace(returncode=None)
+    gateway.runtime.instance_id = "new-worker-instance"
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app), base_url="http://test") as client:
+        result = await client.post(
+            "/v1/chat/completions",
+            headers={"X-CR-Expected-Instance-Id": "previous-worker-instance"},
+            json={"messages": [{"role": "user", "content": "Hola"}]},
+        )
+        assert result.status_code == 409
+        assert result.headers["x-cr-safe-rejection"] == "1"
+        assert gateway.runtime.active == 0
