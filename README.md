@@ -99,3 +99,44 @@ These tests mock the internal vLLM HTTP service. **They do not test CUDA compati
 - Runpod authenticates gateway calls; the internal vLLM server binds to **127.0.0.1** and the image publishes only port `8000`.
 - The gateway never forwards the external `Authorization` header to the internal engine.
 - Authentication, per-user quotas, rate limiting and message validation for CreaRapido users remain the responsibility of **CreaRapido's backend**.
+
+## Blackwell MIG 24 GB compatibility and slow inference diagnostics
+
+The pinned upstream `vllm/vllm-openai:v0.11.2` release is intended for CUDA 12.8+
+Blackwell support. Its exact installed dependencies must still be verified
+rather than assuming a tag proves the final image is compatible. The Docker
+build now executes `pip check` and `scripts/check_gpu_stack.py --mode build`
+and **fails** if the compiled CUDA is older than 12.8 or vLLM differs from
+0.11.2. The script prints the built PyTorch, CUDA, FastAPI, Hugging Face Hub,
+and supported architecture versions. The existing vLLM/PyTorch dependencies
+are preserved instead of running a broad `pip install` with open version
+ranges from `builder/requirements.txt`. The base must supply `httpx`,
+`fastapi`, `uvicorn` and `huggingface_hub`; a missing component will be
+reported during the build, not silently installed from an unpinned release.
+
+**GPU-specific validation requires an actual running MIG worker.** After
+deploying the test image, in its container run:
+
+```bash
+python3 /app/check_gpu_stack.py --mode runtime
+nvidia-smi
+```
+
+Verify `compute_capability` (Blackwell `12.0`), available memory
+(approximately 24 GiB before allocations), and host driver compatibility.
+The optional `sm120_precompiled` field refers to the PyTorch wheel's
+compiled targets; `false` alone does not prove every library is incompatible
+because some CUDA kernels may compile at runtime. The MIG slice provides a
+fraction of the full 96GB RTX PRO 6000 GPU's resources and cannot be assumed
+to perform like a whole card.
+
+**Do not change `ENFORCE_EAGER` blindly.** For latency measurements,
+compare the same 2000-token context and output length on the same MIG
+profile with `ENFORCE_EAGER=true` vs `false`. Track time to readiness,
+first content token, 50th/95th percentile output tokens/second, and VRAM.
+CUDA Graphs can improve steady-state speed but add initialization time and
+memory consumption. Do not compare different worker instances or
+different GPU partitions and attribute the difference to dependencies.
+
+The base-image tag is retained; pin to a registry digest **only after**
+verifying the actual manifest for the chosen platform.
