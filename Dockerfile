@@ -21,7 +21,8 @@ WORKDIR /app
 # silently upgrade/downgrade a dependency and break the matched CUDA wheels.
 # Keep the bundled, tested vLLM/PyTorch/FlashAttention dependencies intact.
 COPY scripts/check_gpu_stack.py /app/check_gpu_stack.py
-RUN python3 -m pip check && \
+COPY scripts/check_base_dependencies.py /app/check_base_dependencies.py
+RUN python3 /app/check_base_dependencies.py && \
     python3 /app/check_gpu_stack.py --mode build --output /app/cuda-stack.json
 
 # Public Apache-2.0 model. Download at build-time (NOT on each GPU cold start).
