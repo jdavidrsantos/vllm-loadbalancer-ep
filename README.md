@@ -138,5 +138,6 @@ CUDA Graphs can improve steady-state speed but add initialization time and
 memory consumption. Do not compare different worker instances or
 different GPU partitions and attribute the difference to dependencies.
 
-The base-image tag is retained; pin to a registry digest **only after**
-verifying the actual manifest for the chosen platform.
+The official Docker Hub v0.11.2 multi-platform index digest is pinned in the
+Dockerfile, including its linux/amd64 manifest. Avoid changing the base
+without rerunning both build checks and the runtime MIG diagnostics.
