@@ -8,6 +8,7 @@ import argparse
 import importlib.metadata
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -40,10 +41,25 @@ def inspect_stack(mode: str) -> dict:
         "cuda_compiled": torch.version.cuda,
         "compiled_arch_list": torch.cuda.get_arch_list(),
     }
-    if version("vllm") != "0.11.2":
-        raise RuntimeError("Unexpected vLLM release; recheck the official image")
+    # The image is already pinned by a Docker manifest digest. Its Python
+    # distribution may report a local/dev/build version different from the
+    # human-readable Docker tag. That alone is not a CUDA incompatibility.
+    # Still report the discrepancy for investigation rather than hiding it.
+    installed_vllm = result["vllm"]
+    if installed_vllm == "missing":
+        raise RuntimeError("vLLM Python distribution is missing from the base image")
+    if not shutil.which("vllm"):
+        raise RuntimeError("vLLM CLI is missing from PATH in the base image")
+    if installed_vllm != "0.11.2":
+        result["vllm_version_notice"] = (
+            f"Docker tag v0.11.2; installed distribution: {installed_vllm}. "
+            "Verify release provenance, but this alone does not prove GPU incompatibility."
+        )
     if cuda_tuple(torch.version.cuda or "") < (12, 8):
-        raise RuntimeError("CUDA <12.8: unsupported for the intended Blackwell GPU")
+        raise RuntimeError(
+            f"PyTorch was compiled with CUDA {torch.version.cuda!r}; "
+            "the target Blackwell GPU requires CUDA >=12.8"
+        )
     # Presence of sm_120 in bundled wheel is a useful hint, but device-level
     # verification is authoritative; some kernels use runtime JIT compilation.
     result["sm120_precompiled"] = "sm_120" in result["compiled_arch_list"]
