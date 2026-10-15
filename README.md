@@ -106,8 +106,10 @@ The pinned upstream `vllm/vllm-openai:v0.11.2` release is intended for CUDA 12.8
 Blackwell support. Its exact installed dependencies must still be verified
 rather than assuming a tag proves the final image is compatible. The Docker
 build now executes a narrowly filtered `pip check` and `scripts/check_gpu_stack.py --mode build`
-and **fails** if the compiled CUDA is older than 12.8 or vLLM differs from
-0.11.2. The script prints the built PyTorch, CUDA, FastAPI, Hugging Face Hub,
+and **fails** if compiled CUDA is older than 12.8 or the vLLM package/CLI
+is absent. If the installed vLLM build version differs from the Docker tag,
+it reports the exact version as a warning rather than assuming the CUDA
+stack is incompatible. The script prints the built PyTorch, CUDA, FastAPI, Hugging Face Hub,
 and supported architecture versions. The existing vLLM/PyTorch dependencies
 are preserved instead of running a broad `pip install` with open version
 ranges from `builder/requirements.txt`. The base must supply `httpx`,
