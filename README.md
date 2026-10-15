@@ -1,98 +1,101 @@
-# vLLM Load Balancer
+# CreaRapido vLLM load-balancing worker
 
-A FastAPI-based load balancer for serving vLLM models with RunPod integration. Provides OpenAI-compatible APIs with streaming and non-streaming text generation.
+Runpod **Load Balancing** worker for **`Qwen/Qwen2.5-7B-Instruct`**. The public model weights and tokenizer are downloaded **during the Docker build** and live at `/models/Qwen2.5-7B-Instruct` in the resulting image. No Hugging Face token is needed for this public model, and **no token should be checked into Git or passed in a Docker build argument**.
 
-## Prerequisites
+The worker exposes a lightweight FastAPI gateway on `PORT` immediately, then starts vLLM on `127.0.0.1:8001` (not publicly exposed). Runpod's `/ping` reports **204 initializing → 200 ready** only after vLLM actually answers its internal `/health` probe. An unrecoverable startup failure returns 503.
 
-Before you begin, make sure you have:
+> IMPORTANT: This is a change to **Load Balancing**, not queue-based Serverless. Create a **Load Balancer endpoint**. Queue `/run`, `/runsync`, and job webhooks do not apply to this worker. The image is large and baking weights eliminates download during startup but **cannot eliminate platform provisioning, image pulls, loading VRAM, or cold starts**.
 
-- A RunPod account (sign up at [runpod.io](https://runpod.io))
-- RunPod API key (available in your RunPod dashboard)
-- Basic understanding of REST APIs and HTTP requests
-- `curl` or a similar tool for testing API endpoints
-
-## Docker Image
-
-Use the pre-built Docker image: `runpod/vllm-loadbalancer:dev`
-
-## Environment Variables
-
-Configure these environment variables in your RunPod endpoint:
-
-| Variable | Required | Description | Default | Example |
-|----------|----------|-------------|---------|---------|
-| `MODEL_NAME` | **Yes** | HuggingFace model identifier | None | `microsoft/DialoGPT-medium` |
-| `TENSOR_PARALLEL_SIZE` | No | Number of GPUs for model parallelism | `1` | `2` |
-| `DTYPE` | No | Model precision type | `auto` | `float16` |
-| `TRUST_REMOTE_CODE` | No | Allow remote code execution | `true` | `false` |
-| `MAX_MODEL_LEN` | No | Maximum sequence length | None (auto) | `2048` |
-| `GPU_MEMORY_UTILIZATION` | No | GPU memory usage ratio | `0.9` | `0.8` |
-| `ENFORCE_EAGER` | No | Disable CUDA graphs | `false` | `true` |
-
-## Deployment on RunPod
-
-1. Create a new serverless endpoint
-2. Use Docker image: `runpod/vllm-loadbalancer:dev`
-3. Set required environment variable: `MODEL_NAME` (e.g., "microsoft/DialoGPT-medium")
-4. Optional: Configure additional environment variables as needed
-
-## API Usage with curl
-
-### Text Completion (Non-streaming)
+## Build and deploy
 
 ```bash
-curl -X POST "https://your-endpoint-id.api.runpod.ai/v1/completions" \
-  -H "Authorization: Bearer YOUR_RUNPOD_API_KEY" \
+docker build --platform linux/amd64 -t YOUR_DOCKER_USER/crearapido-qwen25-7b:v1 .
+docker push YOUR_DOCKER_USER/crearapido-qwen25-7b:v1
+```
+
+In the Runpod console, **Serverless → New Endpoint → Import from Docker Registry**, select **Load Balancer** and enter the pushed image. Configure:
+
+| Setting | Value |
+|---|---|
+| HTTP port exposed | `8000` |
+| `PORT` | `8000` |
+| `PORT_HEALTH` | `8000` |
+| Health path | `/ping` |
+| GPU | Recommend **24 GB VRAM or more** for BF16/FP16 weights plus KV cache; test exact GPU/model length |
+| Active/min workers | `0` for minimal idle GPU billing; expect cold starts |
+| Max workers | Start at `2`, increase based on observed concurrency and budgets |
+
+Do **not** configure a Hugging Face token for these public weights. The model is baked locally; production runs with `HF_HUB_OFFLINE=1`. A 24 GB GPU is a safer starting point than 16 GB for unquantized 7B. Models, CUDA and GPU compatibility must be tested on the chosen GPU before production.
+
+### Environment variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PORT` | `8000` | FastAPI ingress and `/ping` port |
+| `PORT_HEALTH` | `8000` | Set in Runpod to same exposed port |
+| `MODEL_PATH` | `/models/Qwen2.5-7B-Instruct` | Baked local model directory |
+| `INTERNAL_VLLM_PORT` | `8001` | Localhost-only vLLM server |
+| `MAX_MODEL_LEN` | `4096` | Context budget; raise after measuring VRAM |
+| `MAX_NUM_SEQS` | `16` | vLLM concurrency cap |
+| `MAX_IN_FLIGHT` | `32` | FastAPI backpressure, HTTP 429 on overload |
+| `DTYPE` | `auto` | Weight dtype (BF16 on supported GPUs) |
+| `GPU_MEMORY_UTILIZATION` | `0.90` | Fraction available to engine |
+| `TENSOR_PARALLEL_SIZE` | `1` | Set to actual GPU count for tensor parallelism |
+| `ENFORCE_EAGER` | `true` | Faster cold start; possibly slower steady-state inference |
+| `STARTUP_TIMEOUT_SECONDS` | `900` | Fail health check if internal vLLM never becomes ready |
+
+To prioritize throughput over startup latency, try `ENFORCE_EAGER=false` and experiment with a *persistent* `VLLM_CACHE_ROOT` if attaching a Network Volume. Do not configure cache paths on a nonexistent volume. For repeatable builds, pass `--build-arg MODEL_REVISION=<verified Hugging Face commit SHA>` rather than `main`.
+
+## API
+
+All requests go through the authenticated **Runpod Load Balancing** URL, never direct to the internal vLLM port:
+
+```bash
+curl -N "https://ENDPOINT_ID.api.runpod.ai/v1/chat/completions" \
+  -H "Authorization: Bearer $RUNPOD_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{
-    "prompt": "Write a story about a brave knight",
-    "max_tokens": 100,
-    "temperature": 0.7,
-    "stream": false
-  }'
+  -d '{"model":"Qwen/Qwen2.5-7B-Instruct","messages":[{"role":"user","content":"Hola, ¿qué puedes hacer?"}],"max_tokens":150,"stream":true}'
 ```
 
-### Text Completion (Streaming)
+- `POST /v1/chat/completions` — OpenAI-compatible chat and streaming.
+- `POST /v1/completions` — text completions (for existing clients).
+- `GET /ping` — Runpod readiness probe: HTTP **204** until vLLM is ready; **200** afterward; 503 if the process fails.
+- `GET /status` — worker-local status and counters (only routable from the LB after a worker becomes healthy).
+
+`model` may be omitted by older clients and will be filled in automatically. The gateway preserves vLLM's OpenAI streaming `data: ...\n\n` protocol, including `[DONE]`, and **does not repeatedly emit cumulative text**. The backend should process each `choices[].delta.content` fragment only once.
+
+### Optional CreaRapido progress events
+
+Add `X-CR-Status-Events: 1` **only** if the backend understands named SSE events. In addition to standard OpenAI `data:` frames, the gateway emits:
+
+```text
+event: cr.status
+data: {"phase":"worker_ready","request_id":"..."}
+
+event: cr.status
+data: {"phase":"streaming","request_id":"..."}
+```
+
+The second event indicates the *first content token reached this gateway*, not when the worker began inference. **Do not enable this option in generic OpenAI SDK clients.** See [CreaRapido integration](docs/crearapido-integration.md).
+
+### Observability and limitations
+
+Worker stdout contains JSON events: `worker_boot`, `model_initializing`, `worker_ready`, `request_accepted`, `first_token`, `request_finished`, `client_disconnected`, `stream_error`, and failure events. Request IDs can correlate log lines. Logs deliberately do not include prompts, generated text, bearer tokens or personal data.
+
+Response headers: `X-CR-Request-Id`, `X-CR-Worker-State`, and for non-streaming `X-CR-Worker-Processing-Ms` and `Server-Timing`. Streaming logs include `first_byte_ms`, `first_token_ms`, and `processing_ms`. The public Runpod LB may not deliver requests to *any* worker during an initial cold start, so no worker-side log can observe the **pre-routing wait**. Measure that from CreaRapido's backend (send → headers), and consult the endpoint's cold-start/delay metrics. Do **not** label all delays as cold starts.
+
+## Test without a GPU
 
 ```bash
-curl -X POST "https://your-endpoint-id.api.runpod.ai/v1/completions" \
-  -H "Authorization: Bearer YOUR_RUNPOD_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "prompt": "Tell me about artificial intelligence",
-    "max_tokens": 200,
-    "temperature": 0.8,
-    "stream": true
-  }'
+python -m pip install -r builder/requirements.txt pytest pytest-asyncio
+pytest -q tests/
 ```
 
-### Chat Completions
+These tests mock the internal vLLM HTTP service. **They do not test CUDA compatibility, GPU memory use, cold-start duration, Runpod routing, or full Docker build**; test these on a staging Runpod endpoint before production.
 
-```bash
-curl -X POST "https://your-endpoint-id.api.runpod.ai/v1/chat/completions" \
-  -H "Authorization: Bearer YOUR_RUNPOD_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "messages": [
-      {"role": "user", "content": "What is the capital of France?"}
-    ],
-    "max_tokens": 50,
-    "temperature": 0.7
-  }'
-```
+## Security
 
-### Health Check
-
-```bash
-curl -X GET "https://your-endpoint-id.api.runpod.ai/ping" \
-  -H "Authorization: Bearer YOUR_RUNPOD_API_KEY"
-```
-
-## Local Testing
-
-Run the test script:
-```bash
-export ENDPOINT_ID="your-endpoint-id"
-export RUNPOD_API_KEY="your-api-key"
-python example.py
-```
+- Never expose `RUNPOD_API_KEY` or a Hugging Face token in browser JS, client-side events, GitHub or image layers. Only CreaRapido's backend holds the Runpod API key.
+- Runpod authenticates gateway calls; the internal vLLM server binds to **127.0.0.1** and the image publishes only port `8000`.
+- The gateway never forwards the external `Authorization` header to the internal engine.
+- Authentication, per-user quotas, rate limiting and message validation for CreaRapido users remain the responsibility of **CreaRapido's backend**.
