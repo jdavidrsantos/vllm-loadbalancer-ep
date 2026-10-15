@@ -50,6 +50,8 @@ class Runtime:
         self.active = 0
         self.completed = 0
         self.failed = 0
+        self.warmup_completed = False
+        self.warmup_finished_ms: int | None = None
         self.lock = asyncio.Lock()
 
     @property
@@ -130,6 +132,8 @@ async def lifespan(_: FastAPI):
     runtime.last_health_ok_at = None
     runtime.phase = "initializing"
     runtime.ready_at = None
+    runtime.warmup_completed = False
+    runtime.warmup_finished_ms = None
     runtime.client = httpx.AsyncClient(timeout=httpx.Timeout(connect=10, read=315, write=30, pool=10))
     try:
         log("worker_boot", model=MODEL_ID, baked_model=MODEL_PATH,
@@ -177,8 +181,10 @@ async def status():
             "phase": "ready" if model_loaded else runtime.phase,
             "model": MODEL_ID,
             "model_loaded": model_loaded,
+            "warmup_completed": runtime.warmup_completed,
+            "warmup_finished_ms": runtime.warmup_finished_ms,
             "instance_id": runtime.instance_id,
-            "ready_for_request": model_loaded and available_slots > 0,
+            "ready_for_request": model_loaded and runtime.warmup_completed and available_slots > 0,
             "active_requests": runtime.active,
             "max_in_flight": MAX_IN_FLIGHT,
             "available_slots": available_slots,
@@ -289,6 +295,9 @@ async def inference(request: Request):
         raise HTTPException(status_code=422, detail="messages must be a list")
 
     streaming = payload.get("stream") is True
+    is_warmup = request.headers.get("x-cr-warmup") == "1"
+    if is_warmup and (streaming or payload.get("max_tokens") != 1):
+        raise HTTPException(status_code=400, detail="Warmup must be nonstreaming and one token")
     opt_in_events = streaming and request.headers.get("x-cr-status-events") == "1"
     await reserve(trace_id)
     log("request_accepted", request_id=trace_id, route=request.url.path, stream=streaming,
@@ -300,6 +309,11 @@ async def inference(request: Request):
             upstream = await runtime.client.post(MODEL_URL + request.url.path, json=payload, headers=headers)
             processing_ms = elapsed_ms(started)
             failed = upstream.status_code >= 400
+            if is_warmup and not failed:
+                runtime.warmup_completed = True
+                runtime.warmup_finished_ms = elapsed_ms(runtime.started)
+                log("warmup_completed", instance_id=runtime.instance_id, request_id=trace_id,
+                    warmup_finished_ms=runtime.warmup_finished_ms)
             await release(failed)
             log("request_finished", request_id=trace_id, status=upstream.status_code,
                 processing_ms=processing_ms, stream=False)
