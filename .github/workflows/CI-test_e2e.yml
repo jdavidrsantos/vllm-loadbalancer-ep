@@ -1,9 +1,7 @@
 name: CD | Test End-to-End
 
 on:
-  push:
-    branches-ignore:
-      - "refs/tags/*"
+  workflow_dispatch:
 
 jobs:
   docker:

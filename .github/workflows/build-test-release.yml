@@ -1,17 +1,7 @@
 name: CD | Build-Test-Release
 
 on:
-  push:
-    branches:
-      - "main"
-  release:
-    types: [published]
   workflow_dispatch:
-    inputs:
-      image_tag:
-        description: "Docker Image Tag"
-        required: false
-        default: "dev"
 
 jobs:
   docker-build:
