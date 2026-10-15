@@ -120,6 +120,7 @@ async def test_status_requires_model_loaded_and_available_slots():
     gateway.runtime.phase = "ready"
     gateway.runtime.process = SimpleNamespace(returncode=None)
     gateway.runtime.instance_id = "boot-a"
+    gateway.runtime.warmup_completed = True
     gateway.runtime.active = gateway.MAX_IN_FLIGHT
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app), base_url="http://test") as client:
         result = (await client.get("/status")).json()
@@ -146,3 +147,32 @@ async def test_instance_mismatch_is_rejected_before_any_inference():
         assert result.status_code == 409
         assert result.headers["x-cr-safe-rejection"] == "1"
         assert gateway.runtime.active == 0
+
+
+@pytest.mark.asyncio
+async def test_completed_warmup_gates_instance_ready_for_request():
+    gateway.runtime.phase = "ready"
+    gateway.runtime.process = SimpleNamespace(returncode=None)
+    gateway.runtime.warmup_completed = False
+    gateway.runtime.active = 0
+    gateway.runtime.client = httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda req: httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+    ))
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app), base_url="http://test") as client:
+            before = (await client.get("/status")).json()
+            assert before["model_loaded"] is True
+            assert before["warmup_completed"] is False
+            assert before["ready_for_request"] is False
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={"X-CR-Warmup": "1"},
+                json={"messages": [{"role": "user", "content": "hi"}],
+                      "max_tokens": 1, "stream": False},
+            )
+            assert response.status_code == 200
+            after = (await client.get("/status")).json()
+            assert after["warmup_completed"] is True
+            assert after["ready_for_request"] is True
+    finally:
+        await gateway.runtime.client.aclose()
