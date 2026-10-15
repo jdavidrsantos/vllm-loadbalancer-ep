@@ -27,7 +27,7 @@ def request(url, token, payload=None, timeout=150):
     )
 
 
-def sample(base, token):
+def sample(base, token, context_tokens=0, output_tokens=80):
     t0 = time.monotonic()
     health_code = None
     try:
@@ -39,10 +39,14 @@ def sample(base, token):
         pass
     health_ms = round((time.monotonic() - t0) * 1000)
     t0 = time.monotonic()
+    # Approximate a real support prompt without sending production user data.
+    # Fixed text makes comparisons across eager/CUDA Graph configurations repeatable.
+    filler = ("Información sobre funciones del editor y publicación de sitios. " * 40)
+    context = (filler * max(1, context_tokens // 450 + 1))[:context_tokens * 4] if context_tokens else ""
     payload = {
         "model": "Qwen/Qwen2.5-7B-Instruct",
-        "messages": [{"role": "user", "content": "Di hola en una frase."}],
-        "max_tokens": 80,
+        "messages": [{"role": "system", "content": context}, {"role": "user", "content": "Explica brevemente cómo crear y publicar un sitio web en CreaRápido."}],
+        "max_tokens": output_tokens,
         "temperature": 0,
         "stream": True,
         "stream_options": {"include_usage": True},
@@ -51,6 +55,9 @@ def sample(base, token):
         assigned_ms = round((time.monotonic() - t0) * 1000)
         worker_id = res.headers.get("X-Runpod-Worker-Id", "")
         first_token_ms = None
+        last_content_at = None
+        max_gap_ms = 0
+        output_tokens_actual = None
         output = ""
         done = False
         for raw in res:
@@ -65,8 +72,15 @@ def sample(base, token):
             if "error" in obj:
                 raise ValueError("Model reported a stream error")
             content = (obj.get("choices") or [{}])[0].get("delta", {}).get("content", "")
+            if isinstance(obj.get("usage"), dict):
+                output_tokens_actual = obj["usage"].get("completion_tokens")
             if content:
-                first_token_ms = first_token_ms or round((time.monotonic() - t0) * 1000)
+                now_ms = round((time.monotonic() - t0) * 1000)
+                if last_content_at is not None:
+                    max_gap_ms = max(max_gap_ms, now_ms - last_content_at)
+                last_content_at = now_ms
+                if first_token_ms is None:
+                    first_token_ms = now_ms
                 output += content
         total_ms = round((time.monotonic() - t0) * 1000)
         if not done or not output.strip():
@@ -77,6 +91,9 @@ def sample(base, token):
         "assignment_ms": assigned_ms,
         "first_token_ms": first_token_ms,
         "total_ms": total_ms,
+        "max_content_gap_ms": max_gap_ms,
+        "output_tokens": output_tokens_actual,
+        "decode_tokens_per_sec": round(output_tokens_actual / max(0.001, (total_ms - first_token_ms) / 1000), 2) if isinstance(output_tokens_actual, int) and first_token_ms is not None else None,
         "worker_id": worker_id,
         "sample": output[:80],
     }
@@ -119,6 +136,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--endpoint", required=True)
     parser.add_argument("--samples", type=int, default=5)
+    parser.add_argument("--context-tokens", type=int, default=1900, help="Approximate support-context length; synthetic text, no user content")
+    parser.add_argument("--output-tokens", type=int, default=120)
     parser.add_argument("--queue-endpoint", default="",
                         help="Optional old queue endpoint, for explicit comparison only")
     parser.add_argument("--cold-wait", action="store_true",
@@ -131,14 +150,14 @@ def main():
     results = []
     for n in range(max(1, min(args.samples, 30))):
         try:
-            data = sample(base, token)
+            data = sample(base, token, max(0, min(args.context_tokens, 3500)), max(1, min(args.output_tokens, 512)))
             data["iteration"] = n + 1
             data["cold_candidate"] = bool(args.cold_wait and n == 0)
             results.append(data)
             print(json.dumps(data, ensure_ascii=False))
         except Exception as exc:
             print(json.dumps({"iteration": n + 1, "error": type(exc).__name__, "detail": str(exc)[:180]}))
-    for field in ("health_ms", "assignment_ms", "first_token_ms", "total_ms"):
+    for field in ("health_ms", "assignment_ms", "first_token_ms", "total_ms", "max_content_gap_ms", "decode_tokens_per_sec"):
         values = [r[field] for r in results if isinstance(r.get(field), int)]
         if values:
             print(field, "mean=", round(statistics.mean(values)),
