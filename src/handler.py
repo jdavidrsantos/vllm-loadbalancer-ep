@@ -22,7 +22,7 @@ MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
 MODEL_PATH = os.getenv("MODEL_PATH", "/models/Qwen2.5-7B-Instruct")
 INTERNAL_PORT = int(os.getenv("INTERNAL_VLLM_PORT", "8001"))
 MODEL_URL = f"http://127.0.0.1:{INTERNAL_PORT}"
-MAX_IN_FLIGHT = int(os.getenv("MAX_IN_FLIGHT", "32"))
+MAX_IN_FLIGHT = int(os.getenv("MAX_IN_FLIGHT", os.getenv("MAX_NUM_SEQS", "16")))
 STARTUP_TIMEOUT = int(os.getenv("STARTUP_TIMEOUT_SECONDS", "900"))
 LOG = logging.getLogger("crearapido.worker")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(message)s")
@@ -40,6 +40,8 @@ def elapsed_ms(start: float) -> int:
 class Runtime:
     def __init__(self) -> None:
         self.started = time.monotonic()
+        self.instance_id = str(uuid4())
+        self.last_health_ok_at: float | None = None
         self.phase = "initializing"
         self.ready_at: float | None = None
         self.process: asyncio.subprocess.Process | None = None
@@ -77,39 +79,61 @@ def command() -> list[str]:
 
 
 async def monitor_model() -> None:
-    """Probe the *internal* inference engine; never mark ready too early."""
+    """Keep checking actual vLLM health for the entire worker lifetime.
+
+    Runpod's RUNNING/starting is NOT a readiness signal. Once vLLM passes
+    /health the worker is routable, but a later engine failure must revoke it.
+    """
     deadline = time.monotonic() + STARTUP_TIMEOUT
     last_report = 0.0
-    while time.monotonic() < deadline:
+    while True:
+        now = time.monotonic()
         if runtime.process and runtime.process.returncode is not None:
             runtime.phase = "failed"
             log("model_process_exited", code=runtime.process.returncode, boot_ms=elapsed_ms(runtime.started))
             return
+
+        healthy = False
         try:
             response = await runtime.client.get(f"{MODEL_URL}/health", timeout=2.0)
-            if response.status_code == 200:
-                runtime.phase = "ready"
-                runtime.ready_at = time.monotonic()
-                log("worker_ready", model=MODEL_ID, boot_ms=elapsed_ms(runtime.started))
-                return
+            healthy = response.status_code == 200
         except (httpx.HTTPError, RuntimeError):
             pass
-        if time.monotonic() - last_report >= 10:
-            log("model_initializing", elapsed_ms=elapsed_ms(runtime.started))
-            last_report = time.monotonic()
-        await asyncio.sleep(1)
-    runtime.phase = "failed"
-    log("model_startup_timeout", boot_ms=elapsed_ms(runtime.started))
 
+        if healthy:
+            if runtime.phase != "ready":
+                runtime.phase = "ready"
+                if runtime.ready_at is None:
+                    runtime.ready_at = time.monotonic()
+                log("worker_ready", model=MODEL_ID, boot_ms=elapsed_ms(runtime.started),
+                    instance_id=runtime.instance_id)
+            runtime.last_health_ok_at = time.monotonic()
+        elif runtime.ready_at is None and now >= deadline:
+            runtime.phase = "failed"
+            log("model_startup_timeout", boot_ms=elapsed_ms(runtime.started))
+            return
+        elif runtime.phase == "ready" and (
+            runtime.last_health_ok_at is None or now - runtime.last_health_ok_at > 4
+        ):
+            runtime.phase = "unhealthy"
+            log("model_health_lost", instance_id=runtime.instance_id)
+        elif runtime.phase == "initializing" and now - last_report >= 10:
+            log("model_initializing", elapsed_ms=elapsed_ms(runtime.started),
+                instance_id=runtime.instance_id)
+            last_report = now
+        await asyncio.sleep(1)
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     runtime.started = time.monotonic()
+    runtime.instance_id = str(uuid4())
+    runtime.last_health_ok_at = None
     runtime.phase = "initializing"
     runtime.ready_at = None
     runtime.client = httpx.AsyncClient(timeout=httpx.Timeout(connect=10, read=315, write=30, pool=10))
     try:
-        log("worker_boot", model=MODEL_ID, baked_model=MODEL_PATH)
+        log("worker_boot", model=MODEL_ID, baked_model=MODEL_PATH,
+            instance_id=runtime.instance_id)
         runtime.process = await asyncio.create_subprocess_exec(*command())
         runtime.monitor = asyncio.create_task(monitor_model())
     except (OSError, ValueError) as exc:
@@ -145,16 +169,27 @@ async def ping():
 
 @app.get("/status")
 async def status():
-    return {
-        "phase": "ready" if runtime.ready else runtime.phase,
-        "model": MODEL_ID,
-        "worker_uptime_ms": elapsed_ms(runtime.started),
-        "model_boot_ms": round((runtime.ready_at - runtime.started) * 1000) if runtime.ready_at else None,
-        "active_requests": runtime.active,
-        "completed_requests": runtime.completed,
-        "failed_requests": runtime.failed,
-    }
-
+    """Worker-local readiness evidence; never aggregate this into a fleet count."""
+    model_loaded = runtime.ready
+    available_slots = max(0, MAX_IN_FLIGHT - runtime.active) if model_loaded else 0
+    return JSONResponse(
+        {
+            "phase": "ready" if model_loaded else runtime.phase,
+            "model": MODEL_ID,
+            "model_loaded": model_loaded,
+            "instance_id": runtime.instance_id,
+            "ready_for_request": model_loaded and available_slots > 0,
+            "active_requests": runtime.active,
+            "max_in_flight": MAX_IN_FLIGHT,
+            "available_slots": available_slots,
+            "worker_uptime_ms": elapsed_ms(runtime.started),
+            "model_boot_ms": round((runtime.ready_at - runtime.started) * 1000) if runtime.ready_at else None,
+            "last_health_age_ms": elapsed_ms(runtime.last_health_ok_at) if runtime.last_health_ok_at else None,
+            "completed_requests": runtime.completed,
+            "failed_requests": runtime.failed,
+        },
+        headers={"Cache-Control": "no-store", "X-CR-Worker-Instance-Id": runtime.instance_id},
+    )
 
 def worker_headers(trace_id: str, processing_ms: int | None = None) -> dict[str, str]:
     headers = {"X-CR-Request-Id": trace_id, "X-CR-Worker-State": "ready", "Cache-Control": "no-store"}
@@ -168,7 +203,8 @@ async def reserve(trace_id: str) -> None:
     async with runtime.lock:
         if runtime.active >= MAX_IN_FLIGHT:
             log("request_rejected", reason="overloaded", request_id=trace_id, active=runtime.active)
-            raise HTTPException(status_code=429, detail="Worker at capacity", headers={"Retry-After": "2"})
+            raise HTTPException(status_code=429, detail="Worker at capacity",
+                                headers={"Retry-After": "2", "X-CR-Safe-Rejection": "1"})
         runtime.active += 1
 
 
@@ -228,7 +264,17 @@ async def inference(request: Request):
     started = time.monotonic()
     if not runtime.ready:
         log("request_rejected", reason=runtime.phase, request_id=trace_id)
-        raise HTTPException(status_code=503, detail="Model initializing", headers={"Retry-After": "3"})
+        raise HTTPException(status_code=503, detail="Model not ready",
+                            headers={"Retry-After": "3", "X-CR-Safe-Rejection": "1"})
+
+    expected_instance = request.headers.get("x-cr-expected-instance-id")
+    if expected_instance and expected_instance != runtime.instance_id:
+        # The load balancer chose a different worker after the verified probe.
+        # Reject BEFORE reserving a slot or submitting anything to vLLM.
+        log("request_rejected", reason="worker_changed", request_id=trace_id,
+            instance_id=runtime.instance_id)
+        raise HTTPException(status_code=409, detail="Verified worker changed",
+                            headers={"X-CR-Safe-Rejection": "1"})
 
     try:
         payload = await request.json()
