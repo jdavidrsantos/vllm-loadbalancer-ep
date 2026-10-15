@@ -105,7 +105,7 @@ These tests mock the internal vLLM HTTP service. **They do not test CUDA compati
 The pinned upstream `vllm/vllm-openai:v0.11.2` release is intended for CUDA 12.8+
 Blackwell support. Its exact installed dependencies must still be verified
 rather than assuming a tag proves the final image is compatible. The Docker
-build now executes `pip check` and `scripts/check_gpu_stack.py --mode build`
+build now executes a narrowly filtered `pip check` and `scripts/check_gpu_stack.py --mode build`
 and **fails** if the compiled CUDA is older than 12.8 or vLLM differs from
 0.11.2. The script prints the built PyTorch, CUDA, FastAPI, Hugging Face Hub,
 and supported architecture versions. The existing vLLM/PyTorch dependencies
@@ -141,3 +141,7 @@ different GPU partitions and attribute the difference to dependencies.
 The official Docker Hub v0.11.2 multi-platform index digest is pinned in the
 Dockerfile, including its linux/amd64 manifest. Avoid changing the base
 without rerunning both build checks and the runtime MIG diagnostics.
+
+### Known upstream dependency warning
+
+The official vLLM 0.11.2 base may report `pygobject 3.42.1 requires pycairo, which is not installed.` from `pip check`. Because this optional desktop binding is unrelated to GPU inference, `scripts/check_base_dependencies.py` allows only that precise diagnostic. All other `pip check` conflicts still fail the Docker build, and the CUDA >=12.8/vLLM version check still runs. Do not broadly suppress pip conflicts or install GUI dependencies just to silence the warning.
