@@ -82,10 +82,45 @@ def sample(base, token):
     }
 
 
+def sample_queue(endpoint, token):
+    """Optional queue baseline: submit exactly one job, then only poll status."""
+    base = "https://api.runpod.ai/v2/" + endpoint
+    t0 = time.monotonic()
+    with request(base + "/run", token, {
+        "input": {
+            "messages": [{"role": "user", "content": "Di hola en una frase."}],
+            "max_tokens": 80,
+            "sampling_params": {"max_tokens": 80, "temperature": 0},
+        }
+    }) as res:
+        job_id = json.load(res)["id"]
+    submitted_ms = round((time.monotonic() - t0) * 1000)
+    deadline = time.monotonic() + 180
+    while time.monotonic() < deadline:
+        with request(base + "/status/" + job_id, token, timeout=15) as res:
+            job = json.load(res)
+        state = str(job.get("status", "")).upper()
+        if state == "COMPLETED":
+            return {
+                "submitted_ms": submitted_ms,
+                "total_ms": round((time.monotonic() - t0) * 1000),
+                "delay_ms": job.get("delayTime"),
+                "execution_ms": job.get("executionTime"),
+                "worker_id": job.get("workerId", ""),
+                "state": state,
+            }
+        if state in ("FAILED", "CANCELLED", "TIMED_OUT"):
+            raise RuntimeError("Queue worker ended with " + state)
+        time.sleep(2)
+    raise TimeoutError("Queue worker not completed within 180 seconds")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--endpoint", required=True)
     parser.add_argument("--samples", type=int, default=5)
+    parser.add_argument("--queue-endpoint", default="",
+                        help="Optional old queue endpoint, for explicit comparison only")
     parser.add_argument("--cold-wait", action="store_true",
                         help="Label first sample as cold candidate; manually scale to zero first")
     args = parser.parse_args()
@@ -108,6 +143,14 @@ def main():
         if values:
             print(field, "mean=", round(statistics.mean(values)),
                   "p90=", sorted(values)[min(len(values)-1, int(len(values)*.9))])
+    if args.queue_endpoint:
+        print("Queue baseline (deliberate extra billable test request):")
+        try:
+            queue = sample_queue(args.queue_endpoint, token)
+            print(json.dumps(queue, ensure_ascii=False))
+        except Exception as exc:
+            print(json.dumps({"queue_error": type(exc).__name__, "detail": str(exc)[:180]}))
+    print("Note: Compare multiple identical prompts; model, GPU and traffic may differ.")
     print("Note: /ping and inference may reach different workers. Compare worker IDs and Runpod logs.")
 
 
