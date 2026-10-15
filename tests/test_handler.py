@@ -120,6 +120,7 @@ async def test_status_requires_model_loaded_and_available_slots():
     gateway.runtime.phase = "ready"
     gateway.runtime.process = SimpleNamespace(returncode=None)
     gateway.runtime.instance_id = "boot-a"
+    gateway.runtime.warmup_completed = True
     gateway.runtime.active = gateway.MAX_IN_FLIGHT
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app), base_url="http://test") as client:
         result = (await client.get("/status")).json()
