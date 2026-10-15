@@ -1,7 +1,7 @@
 # vLLM image includes a CUDA-compatible torch/vLLM build. Pin for reproducibility.
-# Verified official amd64 v0.11.2 manifest: CUDA 12.9.1 (Blackwell >=12.8).
-# Digest lock ensures another rebuild cannot silently change the CUDA/Torch stack.
-FROM vllm/vllm-openai:v0.11.2@sha256:2c908d5a84ed251b6a17d179f42d06df1aff353007779ac5eecd8a0ea3fe9331
+# Keep the upstream release tag; use a verified registry digest only after
+# confirming its multi-platform manifest on the intended build machine.
+FROM vllm/vllm-openai:v0.11.2
 
 ARG MODEL_ID=Qwen/Qwen2.5-7B-Instruct
 ARG MODEL_REVISION=main
