@@ -136,7 +136,7 @@ app = FastAPI(title="CreaRapido vLLM Worker", version="2.0.0", lifespan=lifespan
 
 @app.get("/ping")
 async def ping():
-    if runtime.phase == "failed":
+    if runtime.phase == "failed" or (runtime.process and runtime.process.returncode is not None):
         return Response(status_code=503)
     if not runtime.ready:
         return Response(status_code=204)  # No response body is allowed for HTTP 204.
@@ -291,8 +291,9 @@ async def inference(request: Request):
         except (httpx.HTTPError, asyncio.TimeoutError) as exc:
             failed = True
             log("stream_error", request_id=trace_id, error_type=type(exc).__name__)
+            # Never mark a broken generation as successfully completed.
+            # Clients must reject an interrupted stream even if tokens were emitted.
             yield b'data: {"error":{"message":"Upstream stream interrupted"}}\n\n'
-            yield b"data: [DONE]\n\n"
         except asyncio.CancelledError:
             failed = True
             log("client_disconnected", request_id=trace_id, ms=elapsed_ms(started))
