@@ -22,7 +22,7 @@ MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
 MODEL_PATH = os.getenv("MODEL_PATH", "/models/Qwen2.5-7B-Instruct")
 INTERNAL_PORT = int(os.getenv("INTERNAL_VLLM_PORT", "8001"))
 MODEL_URL = f"http://127.0.0.1:{INTERNAL_PORT}"
-MAX_IN_FLIGHT = int(os.getenv("MAX_IN_FLIGHT", "32"))
+MAX_IN_FLIGHT = int(os.getenv("MAX_IN_FLIGHT", os.getenv("MAX_NUM_SEQS", "16")))
 STARTUP_TIMEOUT = int(os.getenv("STARTUP_TIMEOUT_SECONDS", "900"))
 LOG = logging.getLogger("crearapido.worker")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(message)s")
