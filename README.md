@@ -37,7 +37,7 @@ Do **not** configure a Hugging Face token for these public weights. The model is
 | `INTERNAL_VLLM_PORT` | `8001` | Localhost-only vLLM server |
 | `MAX_MODEL_LEN` | `4096` | Context budget; raise after measuring VRAM |
 | `MAX_NUM_SEQS` | `16` | vLLM concurrency cap |
-| `MAX_IN_FLIGHT` | `32` | FastAPI backpressure, HTTP 429 on overload |
+| `MAX_IN_FLIGHT` | `16` | FastAPI backpressure, HTTP 429 on overload |
 | `DTYPE` | `auto` | Weight dtype (BF16 on supported GPUs) |
 | `GPU_MEMORY_UTILIZATION` | `0.90` | Fraction available to engine |
 | `TENSOR_PARALLEL_SIZE` | `1` | Set to actual GPU count for tensor parallelism |
@@ -147,3 +147,37 @@ without rerunning both build checks and the runtime MIG diagnostics.
 ### Known upstream dependency warning
 
 The official vLLM 0.11.2 base may report `pygobject 3.42.1 requires pycairo, which is not installed.` from `pip check`. Because this optional desktop binding is unrelated to GPU inference, `scripts/check_base_dependencies.py` allows only that precise diagnostic. All other `pip check` conflicts still fail the Docker build, and the CUDA >=12.8/vLLM version check still runs. Do not broadly suppress pip conflicts or install GUI dependencies just to silence the warning.
+
+## Per-instance warmup and inference performance comparisons
+
+Concurrent requests with `X-CR-Warmup: 1` on the **same worker boot** are
+coalesced: the first call runs a one-token inference and a second call waits
+for completion, then receives `{"status":"already_warm"}` with
+`X-CR-Warmup-Reused: 1`. Failures do not mark an instance warm, so the next
+attempt can retry. The readiness contract (`warmup_completed`) is unchanged.
+An external controller may still warm **different** instances independently.
+
+To compare cold readiness versus steady-state generation, deploy two **test**
+endpoints with the same image/GPU/model and use Runpod environment variable
+`ENFORCE_EAGER=true` on one and `ENFORCE_EAGER=false` on the other.
+Do not change the production default before measuring startup and VRAM.
+
+```bash
+RUNPOD_API_KEY=... python3 scripts/benchmark_lb.py --endpoint ENDPOINT_ID \
+  --samples 5 --context-tokens 1900 --output-tokens 120
+```
+
+The benchmark generates synthetic context (no real user content), logs
+assignment, first token, overall completion, observed maximum gap between
+content events and token throughput when the vLLM usage frame is available.
+The generated text is not guaranteed to contain a fixed number of output
+tokens; compare only samples with similar completion lengths. For a true
+same-worker experiment, compare worker IDs and instance logs; Runpod may
+route successive test requests to different workers.
+
+Worker `request_finished` logs now include `content_events`,
+`max_content_gap_ms`, `output_tokens` and `tokens_per_second`. The gap is
+between SSE frames containing content, not necessarily individual model tokens.
+These fields never contain user prompts or generated text.
+
+Note: tests/ and Docker build do not validate real Blackwell GPU speed.
