@@ -1,5 +1,7 @@
 # vLLM image includes a CUDA-compatible torch/vLLM build. Pin for reproducibility.
-FROM vllm/vllm-openai:v0.11.2
+# The upstream Docker Hub index digest has been verified for v0.11.2.
+# Pinning it keeps the CUDA/PyTorch/vLLM stack reproducible across rebuilds.
+FROM vllm/vllm-openai:v0.11.2@sha256:2c908d5a84ed251b6a17d179f42d06df1aff353007779ac5eecd8a0ea3fe9331
 
 ARG MODEL_ID=Qwen/Qwen2.5-7B-Instruct
 ARG MODEL_REVISION=main
@@ -14,8 +16,13 @@ ENV MODEL_PATH=/models/Qwen2.5-7B-Instruct \
     PYTHONUNBUFFERED=1
 
 WORKDIR /app
-COPY builder/requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+# FastAPI, Uvicorn, httpx and huggingface-hub are already included in the
+# official vLLM image. Re-installing loosely ranged libraries here could
+# silently upgrade/downgrade a dependency and break the matched CUDA wheels.
+# Keep the bundled, tested vLLM/PyTorch/FlashAttention dependencies intact.
+COPY scripts/check_gpu_stack.py /app/check_gpu_stack.py
+RUN python3 -m pip check && \
+    python3 /app/check_gpu_stack.py --mode build --output /app/cuda-stack.json
 
 # Public Apache-2.0 model. Download at build-time (NOT on each GPU cold start).
 # Never pass a Hugging Face token via build args or bake secrets into an image.
