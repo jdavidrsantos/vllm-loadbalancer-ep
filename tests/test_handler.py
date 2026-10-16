@@ -21,6 +21,20 @@ def reset_runtime():
     yield
 
 
+def test_max_model_len_default_and_env_override(monkeypatch):
+    monkeypatch.delenv("MAX_MODEL_LEN", raising=False)
+    args = gateway.command()
+    assert args[args.index("--max-model-len") + 1] == "8192"
+
+    monkeypatch.setenv("MAX_MODEL_LEN", "4096")
+    args = gateway.command()
+    assert args[args.index("--max-model-len") + 1] == "4096"
+
+    monkeypatch.setenv("MAX_MODEL_LEN", "8192")
+    args = gateway.command()
+    assert args[args.index("--max-model-len") + 1] == "8192"
+
+
 @pytest.mark.asyncio
 async def test_health_204_until_engine_ready():
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app), base_url="http://test") as client:
