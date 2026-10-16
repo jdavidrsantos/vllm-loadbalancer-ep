@@ -31,6 +31,10 @@ RUN HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 MODEL_ID="$MODEL_ID" MODEL_REVISION=
     python3 -c 'import os; from huggingface_hub import snapshot_download; snapshot_download(repo_id=os.environ["MODEL_ID"], revision=os.environ["MODEL_REVISION"], local_dir="/models/Qwen2.5-7B-Instruct", ignore_patterns=["*.bin", "*.pt", "*.msgpack", "*.h5"])'
 
 COPY src/handler.py /app/handler.py
+COPY src/warmup_profile.py /app/warmup_profile.py
+# Fail during image build rather than crashing every Runpod worker at boot.
+RUN python3 -m py_compile /app/handler.py /app/warmup_profile.py && \
+    cd /app && python3 -c 'import warmup_profile; from warmup_profile import synthetic_support_warmup; assert synthetic_support_warmup("Qwen/Qwen2.5-7B-Instruct")["max_tokens"] >= 16'
 EXPOSE 8000
 # Override vLLM's base-image entrypoint so health responds while the engine boots.
 ENTRYPOINT ["python3", "/app/handler.py"]
