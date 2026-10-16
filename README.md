@@ -35,7 +35,7 @@ Do **not** configure a Hugging Face token for these public weights. The model is
 | `PORT_HEALTH` | `8000` | Set in Runpod to same exposed port |
 | `MODEL_PATH` | `/models/Qwen2.5-7B-Instruct` | Baked local model directory |
 | `INTERNAL_VLLM_PORT` | `8001` | Localhost-only vLLM server |
-| `MAX_MODEL_LEN` | `4096` | Context budget; raise after measuring VRAM |
+| `MAX_MODEL_LEN` | `8192` | Maximum prompt + completion tokens together; override in Runpod template if needed |
 | `MAX_NUM_SEQS` | `16` | vLLM concurrency cap |
 | `MAX_IN_FLIGHT` | `16` | FastAPI backpressure, HTTP 429 on overload |
 | `DTYPE` | `auto` | Weight dtype (BF16 on supported GPUs) |
@@ -43,6 +43,33 @@ Do **not** configure a Hugging Face token for these public weights. The model is
 | `TENSOR_PARALLEL_SIZE` | `1` | Set to actual GPU count for tensor parallelism |
 | `ENFORCE_EAGER` | `true` | Faster cold start; possibly slower steady-state inference |
 | `STARTUP_TIMEOUT_SECONDS` | `900` | Fail health check if internal vLLM never becomes ready |
+
+### Upgrade an existing CreaRápido Load Balancing endpoint to 8K
+
+The worker already passes `MAX_MODEL_LEN` from its environment to
+`vllm serve --max-model-len`. **No new image is required just to change this
+variable on the deployed endpoint.** In the Runpod Serverless template or
+endpoint environment, set:
+
+```env
+MAX_MODEL_LEN=8192
+```
+
+Then **replace/restart the running workers** (or scale down to zero and back
+up) so that new vLLM processes load the new limit. Existing workers continue
+to use their old boot-time settings. Confirm `Using max model len 8192` in
+the worker logs and `max_model_len: 8192` from `GET /status` when using an
+image that exposes that field. If the running image does not yet expose the
+status field, the startup logs are authoritative.
+
+This is within Qwen2.5-7B-Instruct's native 32,768-token context, so YaRN is
+not required. On the same GPU, 8K consumes more KV cache for long requests
+than 4K and may lower practical parallelism; keep `MAX_NUM_SEQS=16` until
+concurrent load tests say otherwise. Use at least the recommended 24 GB VRAM,
+check model initialization and KV cache availability, and keep the backend's
+history/output budget bounded to avoid another overflow at 8K. Changing this
+Dockerfile default only affects **future rebuilt images**, not already
+deployed workers.
 
 To prioritize throughput over startup latency, try `ENFORCE_EAGER=false` and experiment with a *persistent* `VLLM_CACHE_ROOT` if attaching a Network Volume. Do not configure cache paths on a nonexistent volume. For repeatable builds, pass `--build-arg MODEL_REVISION=<verified Hugging Face commit SHA>` rather than `main`.
 
