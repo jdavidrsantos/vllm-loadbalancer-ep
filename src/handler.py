@@ -77,7 +77,7 @@ def command() -> list[str]:
         "--served-model-name", MODEL_ID,
         "--host", "127.0.0.1", "--port", str(INTERNAL_PORT),
         "--dtype", os.getenv("DTYPE", "auto"),
-        "--max-model-len", os.getenv("MAX_MODEL_LEN", "4096"),
+        "--max-model-len", os.getenv("MAX_MODEL_LEN", "8192"),
         "--max-num-seqs", os.getenv("MAX_NUM_SEQS", "16"),
         "--gpu-memory-utilization", os.getenv("GPU_MEMORY_UTILIZATION", "0.90"),
         "--tensor-parallel-size", os.getenv("TENSOR_PARALLEL_SIZE", "1"),
@@ -196,6 +196,7 @@ async def status():
         {
             "phase": "ready" if model_loaded else runtime.phase,
             "model": MODEL_ID,
+            "max_model_len": int(os.getenv("MAX_MODEL_LEN", "8192")),
             "model_loaded": model_loaded,
             "warmup_completed": runtime.warmup_completed,
             "warmup_finished_ms": runtime.warmup_finished_ms,
