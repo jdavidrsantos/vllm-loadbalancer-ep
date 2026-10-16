@@ -181,3 +181,32 @@ between SSE frames containing content, not necessarily individual model tokens.
 These fields never contain user prompts or generated text.
 
 Note: tests/ and Docker build do not validate real Blackwell GPU speed.
+
+## Versioned realistic support warmup (v2)
+
+The worker now replaces any authenticated `X-CR-Warmup: 1` request with a
+**fixed synthetic** support conversation, approximately 1,900 prompt tokens,
+then decodes 24 tokens (configurable to 16–32). No real question, chat history,
+or user-supplied warmup text is forwarded to vLLM for this phase. Actual prompt
+and completion token counts appear in structured `warmup_completed` logs
+and worker-local `/status`, so the token estimate can be calibrated.
+
+The worker requires at least 16 generated tokens and successful vLLM response
+before it sets `warmup_completed=true`; it otherwise remains unready for
+CreaRápido platform support routing. Concurrent warmup requests on one
+instance still coalesce. A warmer with the previous one-token payload is
+**supported** and converted to the v2 profile, making it safe to deploy
+the worker image *before* deploying the matching CreaRápido backend.
+
+The `WARMUP_OUTPUT_TOKENS` environment variable defaults to `24` and
+supports integers from 16 through 32. Keep the default until production
+measurements compare first real response latency, idle GPU costs, and
+warmup duration. `ENFORCE_EAGER=true` remains unchanged; CUDA Graphs
+experiments belong on a separate test endpoint.
+
+**Rollout order:** (1) merge and build the worker, (2) test its new image on
+a staging Runpod Load Balancer, (3) update the live worker image when approved,
+(4) deploy the backend change. Old workers can still receive warmup calls
+during an image rollout and complete a one-token warmup; verify
+`/status.warmup_profile == "support-chat-v2"` to distinguish instances.
+No inference response is cached for future users.

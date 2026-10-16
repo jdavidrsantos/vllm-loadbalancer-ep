@@ -156,7 +156,7 @@ async def test_completed_warmup_gates_instance_ready_for_request():
     gateway.runtime.warmup_completed = False
     gateway.runtime.active = 0
     gateway.runtime.client = httpx.AsyncClient(transport=httpx.MockTransport(
-        lambda req: httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+        lambda req: httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}], "usage": {"prompt_tokens": 1900, "completion_tokens": 24}})
     ))
     try:
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app), base_url="http://test") as client:
@@ -186,7 +186,7 @@ async def test_parallel_warmups_generate_only_once():
         nonlocal calls
         calls += 1
         await asyncio.sleep(0.03)
-        return httpx.Response(200, json={"choices": [{"message": {"content": "hi"}}]})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "hi"}}], "usage": {"prompt_tokens": 1900, "completion_tokens": 24}})
     gateway.runtime.phase = "ready"
     gateway.runtime.process = SimpleNamespace(returncode=None)
     gateway.runtime.warmup_completed = False
@@ -219,7 +219,7 @@ async def test_failed_warmup_does_not_poison_future_attempt():
     def handler(request):
         nonlocal calls
         calls += 1
-        return httpx.Response(503 if calls == 1 else 200, json={"ok": True})
+        return httpx.Response(503 if calls == 1 else 200, json={"usage": {"prompt_tokens": 1900, "completion_tokens": 24}})
     gateway.runtime.phase = "ready"
     gateway.runtime.process = SimpleNamespace(returncode=None)
     gateway.runtime.warmup_completed = False
@@ -247,3 +247,84 @@ def test_stream_probe_tracks_content_gap_and_usage():
     assert probe.content_events == 2
     assert probe.output_tokens == 2
     assert probe.max_content_gap_ms >= 0
+
+
+def test_representative_warmup_profile_has_fixed_synthetic_context(monkeypatch):
+    from warmup_profile import synthetic_support_warmup, warmup_context_chars
+    monkeypatch.setenv("WARMUP_OUTPUT_TOKENS", "24")
+    payload = synthetic_support_warmup(gateway.MODEL_ID)
+    assert payload["max_tokens"] == 24
+    assert payload["min_tokens"] == 16
+    assert payload["stream"] is False
+    assert len(payload["messages"]) == 12
+    assert warmup_context_chars() >= 5500
+    assert all("secret" not in m["content"].lower() for m in payload["messages"])
+    monkeypatch.setenv("WARMUP_OUTPUT_TOKENS", "40")
+    with pytest.raises(ValueError):
+        synthetic_support_warmup(gateway.MODEL_ID)
+
+
+@pytest.mark.asyncio
+async def test_legacy_warmup_is_replaced_with_realistic_synthetic_request():
+    import asyncio
+    import json
+    sent = []
+    def fake_vllm(request):
+        body = json.loads(request.content)
+        sent.append(body)
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "respuesta sintética"}}],
+            "usage": {"prompt_tokens": 1935, "completion_tokens": 24},
+        })
+    gateway.runtime.phase = "ready"
+    gateway.runtime.process = SimpleNamespace(returncode=None)
+    gateway.runtime.instance_id = "warm-boot"
+    gateway.runtime.warmup_completed = False
+    gateway.runtime.warmup_lock = asyncio.Lock()
+    gateway.runtime.active = 0
+    gateway.runtime.client = httpx.AsyncClient(transport=httpx.MockTransport(fake_vllm))
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app),
+                                    base_url="http://test") as client:
+            result = await client.post("/v1/chat/completions",
+                json={"messages": [{"role":"user","content":"private-message-not-to-forward"}],
+                      "max_tokens":1,"stream":False},
+                headers={"X-CR-Warmup":"1"})
+            assert result.status_code == 200
+            assert len(sent) == 1
+            assert sent[0]["max_tokens"] == 24
+            assert sent[0]["min_tokens"] == 16
+            assert "private-message-not-to-forward" not in json.dumps(sent[0])
+            assert gateway.runtime.warmup_completed
+            status = (await client.get("/status")).json()
+            assert status["warmup_profile"] == "support-chat-v2"
+            assert status["warmup_prompt_tokens"] == 1935
+            assert status["warmup_output_tokens"] == 24
+    finally:
+        await gateway.runtime.client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_warmup_without_actual_decode_does_not_mark_worker_ready():
+    import asyncio
+    gateway.runtime.phase = "ready"
+    gateway.runtime.process = SimpleNamespace(returncode=None)
+    gateway.runtime.warmup_completed = False
+    gateway.runtime.warmup_lock = asyncio.Lock()
+    gateway.runtime.active = 0
+    gateway.runtime.client = httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, json={
+            "usage": {"prompt_tokens": 1900, "completion_tokens": 2},
+        })
+    ))
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app),
+                                    base_url="http://test") as client:
+            result = await client.post("/v1/chat/completions",
+                json={"messages":[{"role":"user","content":"hi"}],"max_tokens":1},
+                headers={"X-CR-Warmup":"1"})
+            assert result.status_code == 502
+            assert gateway.runtime.warmup_completed is False
+            assert gateway.runtime.active == 0
+    finally:
+        await gateway.runtime.client.aclose()

@@ -16,6 +16,7 @@ import time
 from uuid import uuid4
 
 import httpx
+from warmup_profile import WARMUP_PROFILE, synthetic_support_warmup
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
@@ -56,6 +57,9 @@ class Runtime:
         self.warmup_processing_ms: int | None = None
         self.warmup_attempts = 0
         self.warmup_reused = 0
+        self.warmup_profile: str | None = None
+        self.warmup_prompt_tokens: int | None = None
+        self.warmup_output_tokens: int | None = None
         self.warmup_lock = asyncio.Lock()
         self.lock = asyncio.Lock()
 
@@ -142,6 +146,9 @@ async def lifespan(_: FastAPI):
     runtime.warmup_processing_ms = None
     runtime.warmup_attempts = 0
     runtime.warmup_reused = 0
+    runtime.warmup_profile = None
+    runtime.warmup_prompt_tokens = None
+    runtime.warmup_output_tokens = None
     runtime.warmup_lock = asyncio.Lock()
     runtime.client = httpx.AsyncClient(timeout=httpx.Timeout(connect=10, read=315, write=30, pool=10))
     try:
@@ -196,6 +203,9 @@ async def status():
             "warmup_in_progress": runtime.warmup_lock.locked(),
             "warmup_attempts": runtime.warmup_attempts,
             "warmup_reused": runtime.warmup_reused,
+            "warmup_profile": runtime.warmup_profile,
+            "warmup_prompt_tokens": runtime.warmup_prompt_tokens,
+            "warmup_output_tokens": runtime.warmup_output_tokens,
             "instance_id": runtime.instance_id,
             "ready_for_request": model_loaded and runtime.warmup_completed and available_slots > 0,
             "active_requests": runtime.active,
@@ -318,12 +328,32 @@ async def forward_nonstream(
         processing_ms = elapsed_ms(started)
         failed = upstream.status_code >= 400
         if is_warmup and upstream.status_code == 200:
+            try:
+                result = upstream.json()
+                usage = result.get("usage") if isinstance(result, dict) else None
+                completion = usage.get("completion_tokens") if isinstance(usage, dict) else None
+                prompt = usage.get("prompt_tokens") if isinstance(usage, dict) else None
+                if not isinstance(completion, int) or completion < 16:
+                    log("warmup_incomplete", instance_id=runtime.instance_id,
+                        request_id=trace_id, output_tokens=completion)
+                    return Response(content=upstream.content, status_code=502,
+                                    media_type="application/json",
+                                    headers=worker_headers(trace_id, processing_ms))
+                runtime.warmup_profile = WARMUP_PROFILE
+                runtime.warmup_output_tokens = completion
+                runtime.warmup_prompt_tokens = prompt if isinstance(prompt, int) else None
+            except (ValueError, TypeError, AttributeError):
+                log("warmup_invalid_response", request_id=trace_id)
+                return Response(status_code=502, headers=worker_headers(trace_id, processing_ms))
             runtime.warmup_completed = True
             runtime.warmup_finished_ms = elapsed_ms(runtime.started)
             runtime.warmup_processing_ms = processing_ms
             log("warmup_completed", instance_id=runtime.instance_id, request_id=trace_id,
                 warmup_finished_ms=runtime.warmup_finished_ms,
-                warmup_processing_ms=processing_ms)
+                warmup_processing_ms=processing_ms,
+                warmup_profile=runtime.warmup_profile,
+                prompt_tokens=runtime.warmup_prompt_tokens,
+                output_tokens=runtime.warmup_output_tokens)
         log("request_finished", request_id=trace_id, status=upstream.status_code,
             processing_ms=processing_ms, stream=False)
         return Response(content=upstream.content, status_code=upstream.status_code,
@@ -369,8 +399,12 @@ async def inference(request: Request):
 
     streaming = payload.get("stream") is True
     is_warmup = request.headers.get("x-cr-warmup") == "1"
-    if is_warmup and (streaming or payload.get("max_tokens") != 1):
-        raise HTTPException(status_code=400, detail="Warmup must be nonstreaming and one token")
+    if is_warmup and streaming:
+        raise HTTPException(status_code=400, detail="Warmup must be nonstreaming")
+    if is_warmup:
+        # Replace any legacy one-token request with the fixed, synthetic workload.
+        # Never send real chat content to the warmup engine.
+        payload = synthetic_support_warmup(MODEL_ID)
     opt_in_events = streaming and request.headers.get("x-cr-status-events") == "1"
     if is_warmup:
         # Runpod can route several backend warmup calls to the same worker.
@@ -385,7 +419,8 @@ async def inference(request: Request):
                 log("warmup_reused", request_id=trace_id, instance_id=runtime.instance_id,
                     reused_count=runtime.warmup_reused)
                 return JSONResponse(
-                    {"status": "already_warm", "instance_id": runtime.instance_id},
+                    {"status": "already_warm", "instance_id": runtime.instance_id,
+                     "warmup_profile": runtime.warmup_profile},
                     headers={**worker_headers(trace_id, elapsed_ms(started)),
                              "X-CR-Warmup-Reused": "1"},
                 )
